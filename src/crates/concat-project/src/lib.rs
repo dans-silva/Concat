@@ -26,6 +26,7 @@ pub mod doc;
 pub mod editor;
 pub mod model;
 pub mod placement;
+pub mod silence;
 pub mod speed;
 
 pub use commands::{Command, CommandError, Outcome, consolidation_clips, why_not_merge};
@@ -1499,6 +1500,158 @@ mod tests {
             head.source_start + head.duration * head.speed,
             tail.source_start,
             "the tail picks up where the head ends"
+        );
+    }
+
+    /// The clips of the active timeline as (start, duration, source_start).
+    fn spans_of(editor: &Editor) -> Vec<(f64, f64, f64)> {
+        editor
+            .project()
+            .active()
+            .clips
+            .iter()
+            .map(|clip| (clip.start, clip.duration, clip.source_start))
+            .collect()
+    }
+
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn cut_spans_takes_the_pauses_out_and_closes_the_gaps() {
+        let (mut editor, _, clip_id) = fixture();
+        let outcome = editor
+            .apply(Command::CutSpans {
+                clip_id: clip_id.clone(),
+                spans: vec![[6.0, 7.5], [2.0, 3.0]],
+            })
+            .expect("cuts");
+        assert!(outcome.applied);
+        let mut clips = spans_of(&editor);
+        clips.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(clips.len(), 3, "{clips:?}");
+        let expected = [(0.0, 2.0, 0.0), (2.0, 3.0, 3.0), (5.0, 2.5, 7.5)];
+        for (got, want) in clips.iter().zip(expected) {
+            assert!(
+                near(got.0, want.0) && near(got.1, want.1) && near(got.2, want.2),
+                "{got:?} != {want:?}"
+            );
+        }
+        assert_eq!(
+            editor.project().active().clips[0].id,
+            clip_id,
+            "the first piece keeps the clip's id"
+        );
+        assert!(editor.undo(), "one undo");
+        assert_eq!(
+            spans_of(&editor),
+            vec![(0.0, 10.0, 0.0)],
+            "and it is whole again"
+        );
+    }
+
+    #[test]
+    fn cut_spans_from_the_very_start_drops_the_head() {
+        let (mut editor, _, clip_id) = fixture();
+        editor
+            .apply(Command::CutSpans {
+                clip_id,
+                spans: vec![[-1.0, 1.0]],
+            })
+            .expect("cuts");
+        let clips = spans_of(&editor);
+        assert_eq!(clips.len(), 1, "{clips:?}");
+        assert!(near(clips[0].0, 0.0) && near(clips[0].1, 9.0) && near(clips[0].2, 1.0));
+    }
+
+    #[test]
+    fn cut_spans_pulls_the_lane_left_and_leaves_other_lanes() {
+        let (mut editor, media_id, clip_id) = fixture();
+        let track_id = editor.project().active().tracks[0].id.clone();
+        let later = lane(&mut editor, &media_id, &track_id, &[12.0]);
+        editor
+            .apply(Command::AddTrack { bottom: false })
+            .expect("adds a lane");
+        let other_track = editor
+            .project()
+            .active()
+            .tracks
+            .iter()
+            .find(|track| track.id != track_id)
+            .expect("second lane")
+            .id
+            .clone();
+        let other = lane(&mut editor, &media_id, &other_track, &[12.0]);
+        editor
+            .apply(Command::CutSpans {
+                clip_id,
+                spans: vec![[4.0, 6.0]],
+            })
+            .expect("cuts");
+        let start_of = |editor: &Editor, id: &str| {
+            editor
+                .project()
+                .active()
+                .clips
+                .iter()
+                .find(|clip| clip.id == id)
+                .expect("still there")
+                .start
+        };
+        assert!(
+            near(start_of(&editor, &later[0]), 10.0),
+            "the lane closes up"
+        );
+        assert!(
+            near(start_of(&editor, &other[0]), 12.0),
+            "the other lane stays"
+        );
+    }
+
+    #[test]
+    fn cut_spans_on_nothing_changes_nothing() {
+        let (mut editor, _, clip_id) = fixture();
+        let unknown = editor
+            .apply(Command::CutSpans {
+                clip_id: "nope".to_owned(),
+                spans: vec![[1.0, 2.0]],
+            })
+            .expect("tolerated");
+        assert!(!unknown.applied);
+        let outside = editor
+            .apply(Command::CutSpans {
+                clip_id,
+                spans: vec![[20.0, 30.0], [3.0, 3.001]],
+            })
+            .expect("tolerated");
+        assert!(!outside.applied, "out of the clip, or a sliver");
+        assert_eq!(spans_of(&editor), vec![(0.0, 10.0, 0.0)]);
+        assert!(
+            editor
+                .apply(Command::CutSpans {
+                    clip_id: "x".to_owned(),
+                    spans: vec![[f64::NAN, 1.0]],
+                })
+                .is_err(),
+            "a NaN is refused"
+        );
+    }
+
+    #[test]
+    fn cut_spans_reads_off_the_wire() {
+        let command: Command = serde_json::from_value(json!({
+            "op": "cutSpans",
+            "clipId": "c1",
+            "spans": [[1.0, 2.5], [4.0, 5.0]]
+        }))
+        .expect("parses");
+        assert_eq!(
+            command,
+            Command::CutSpans {
+                clip_id: "c1".to_owned(),
+                spans: vec![[1.0, 2.5], [4.0, 5.0]],
+            }
         );
     }
 
