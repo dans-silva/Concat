@@ -43,6 +43,7 @@ use concat_project::commands::{ClipMove, ClipPatch, TrackFlag, TrimEdge};
 use concat_project::model::{
     self, AppliedFilter, Clip, Project, TextAlign, TextStyle, Timeline, Track, Transition,
 };
+use concat_project::silence;
 
 mod consolidate;
 use consolidate::MergeJob;
@@ -6698,6 +6699,66 @@ impl Studio {
         self.selection.clear();
     }
 
+    /// Takes the pauses out of `clip`'s sound at `strength` and closes the
+    /// gaps, as one step of undo: see [`silence::find_cuts`] for what
+    /// counts as a pause and how much breath is kept. The pauses are found
+    /// in the waveform the lane already holds, so nothing is decoded again.
+    pub fn cut_silences(&mut self, clip: &Clip, strength: silence::Strength) {
+        self.menu_target = None;
+        if clip.speed_curve.is_some() || clip.speed.is_nan() || clip.speed <= 0.0 {
+            self.notify(&t("studio.cutSilenceCurve"), true);
+            return;
+        }
+        let Some(peaks) = self
+            .peaks
+            .get(&art_key(&clip.media_id, clip.audio_stream))
+            .cloned()
+        else {
+            self.notify(&t("studio.cutSilenceWaiting"), true);
+            return;
+        };
+        let finest = peaks.finest();
+        let loudest: Vec<f32> = finest
+            .min
+            .iter()
+            .zip(&finest.max)
+            .map(|(low, high)| low.abs().max(*high))
+            .collect();
+        let from = clip.source_start;
+        let to = clip.source_start + clip.duration * clip.speed;
+        let cuts = silence::find_cuts(&loudest, finest.buckets_per_second, from, to, strength);
+        if cuts.is_empty() {
+            self.notify(&t("studio.cutSilenceNone"), false);
+            return;
+        }
+        // Source seconds to the timeline's: the clip plays its file from
+        // `source_start` at `speed`.
+        let on_timeline = |source: f64| clip.start + (source - from) / clip.speed;
+        let spans: Vec<[f64; 2]> = cuts
+            .iter()
+            .map(|(start, end)| [on_timeline(*start), on_timeline(*end)])
+            .collect();
+        let removed: f64 = spans.iter().map(|[start, end]| end - start).sum();
+        self.apply(Command::CutSpans {
+            clip_id: clip.id.clone(),
+            spans,
+        });
+        // A cut that landed shortened the clip or, from its very start,
+        // took its id with the first pause; a refused one was told already.
+        let landed = self
+            .clip(&clip.id)
+            .is_none_or(|after| after.duration < clip.duration);
+        if landed {
+            self.notify(
+                &tf(
+                    "studio.cutSilenceDone",
+                    &[&cuts.len().to_string(), &format!("{removed:.1}")],
+                ),
+                false,
+            );
+        }
+    }
+
     /// A freeze frame at the playhead on a picture clip.
     ///
     /// Video extracts a JPEG still into the project cache; images reuse their
@@ -9681,6 +9742,40 @@ impl Studio {
                 "",
                 self.clip_has_sound(clip),
             ));
+            // The pauses taken out of what is said, at three strengths, one
+            // step of undo each. Read from the waveform the lane already
+            // holds, so greyed until it has been decoded; and on a clip
+            // with a speed curve, whose seconds do not map straight onto
+            // the file's, or whose sound was detached to another lane,
+            // which the cut would leave behind.
+            let can_cut = !locked
+                && self.clip_has_sound(clip)
+                && clip.muted != Some(true)
+                && clip.speed_curve.is_none()
+                && self
+                    .peaks
+                    .contains_key(&art_key(&clip.media_id, clip.audio_stream));
+            rows.push(action(
+                "silence-light",
+                t("studio.cutSilenceLight"),
+                Glyph::Split,
+                "",
+                can_cut,
+            ));
+            rows.push(action(
+                "silence-natural",
+                t("studio.cutSilenceNatural"),
+                Glyph::Split,
+                "",
+                can_cut,
+            ));
+            rows.push(action(
+                "silence-aggressive",
+                t("studio.cutSilenceAggressive"),
+                Glyph::Split,
+                "",
+                can_cut,
+            ));
             rows.push(rule());
         }
         let audible = clip.kind != model::ClipKind::Image;
@@ -10366,6 +10461,14 @@ impl Studio {
                 self.inspector_jump = (self.inspector_jump.0 + 1, "Video", "Enhance");
             }
             "export-audio" => self.export_clip_audio(id),
+            "silence-light" | "silence-natural" | "silence-aggressive" => {
+                let strength = action
+                    .strip_prefix("silence-")
+                    .and_then(silence::Strength::from_id);
+                if let Some(strength) = strength {
+                    self.cut_silences(&clip, strength);
+                }
+            }
             "detach" => self.detach_audio(&clip),
             "reattach" => {
                 self.apply(Command::ReattachAudio {

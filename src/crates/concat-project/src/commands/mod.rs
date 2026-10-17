@@ -583,6 +583,21 @@ pub enum Command {
         #[serde(default)]
         ripple: bool,
     },
+    /// Takes spans out of one clip and closes the gaps they leave, as one
+    /// edit: what cutting the pauses out of a recording asks for (see
+    /// [`crate::silence`]). Each span is `[start, end]` in timeline
+    /// seconds; a span is clamped to the clip, and one shorter than the
+    /// minimum clip length once clamped is skipped. The piece before the
+    /// first span keeps the clip's id; every other piece is minted, so the
+    /// last id minted is the outcome's. The closing is the ripple
+    /// [`Command::RemoveClips`] does: later clips on the clip's track move
+    /// left, other tracks stay. An unknown clip is a no-op.
+    CutSpans {
+        /// The clip to cut.
+        clip_id: String,
+        /// The spans to take out, in any order; overlapping ones merge.
+        spans: Vec<[f64; 2]>,
+    },
     /// Applies a [`ClipPatch`]: only the fields present change, with the
     /// clamps documented on the patch. An unknown clip is a no-op.
     UpdateClip {
@@ -970,6 +985,7 @@ impl Command {
             Command::MoveClips { moves } => bad(moves.iter().map(|wanted| wanted.start)),
             Command::TrimClip { delta, .. } => bad([*delta]),
             Command::SplitClips { time, .. } => bad([*time]),
+            Command::CutSpans { spans, .. } => bad(spans.iter().flatten().copied()),
             Command::FreezeFrame { time, duration, .. } => bad([*time]) || bad(*duration),
             Command::ReplaceClipMedia {
                 item, source_start, ..
@@ -1090,7 +1106,8 @@ pub fn apply(
         | Command::SetClipEnhanced { .. }
         | Command::MergeClips { .. }
         | Command::ConsolidateClips { .. }
-        | Command::RemoveClips { .. }) => clips::apply(project, mint, command),
+        | Command::RemoveClips { .. }
+        | Command::CutSpans { .. }) => clips::apply(project, mint, command),
         command @ (Command::UpdateClip { .. }
         | Command::SetClipSpeed { .. }
         | Command::SetClipCutout { .. }

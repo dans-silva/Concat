@@ -676,12 +676,103 @@ pub(super) fn apply(
             })
         }
 
+        Command::CutSpans { clip_id, spans } => {
+            let Some(clip) = project
+                .active()
+                .clips
+                .iter()
+                .find(|clip| clip.id == clip_id)
+            else {
+                return Ok(Outcome::default());
+            };
+            let (clip_start, clip_end) = (clip.start, clip.start + clip.duration);
+            let spans = cut_spans_within(&spans, clip_start, clip_end);
+            if spans.is_empty() {
+                return Ok(Outcome::default());
+            }
+            // Latest first, on a staged copy: cutting a late span never
+            // moves an earlier one, and the head of every split keeps the
+            // id, so `clip_id` names the part still to cut each time round.
+            // All or nothing, like a batch, and one step of undo.
+            let mut staged = project.clone();
+            let mut created = None;
+            let mut applied = false;
+            for (start, end) in spans.into_iter().rev() {
+                let Some(clip) = staged.active().clips.iter().find(|clip| clip.id == clip_id)
+                else {
+                    break;
+                };
+                let head_start = clip.start;
+                let tail = super::apply(
+                    &mut staged,
+                    mint,
+                    Command::SplitClips {
+                        clip_ids: vec![clip_id.clone()],
+                        time: end,
+                    },
+                )?;
+                created = tail.created_id.or(created);
+                // A span from the clip's very start has no head to keep:
+                // the clip itself is the piece that goes.
+                let doomed = if start - head_start > MIN_CLIP_DURATION {
+                    let middle = super::apply(
+                        &mut staged,
+                        mint,
+                        Command::SplitClips {
+                            clip_ids: vec![clip_id.clone()],
+                            time: start,
+                        },
+                    )?;
+                    match middle.created_id {
+                        Some(id) => id,
+                        None => continue,
+                    }
+                } else {
+                    clip_id.clone()
+                };
+                applied |= super::apply(
+                    &mut staged,
+                    mint,
+                    Command::RemoveClips {
+                        clip_ids: vec![doomed],
+                        ripple: true,
+                    },
+                )?
+                .applied;
+            }
+            *project = staged;
+            Ok(Outcome {
+                created_id: created,
+                applied,
+            })
+        }
+
         _ => unreachable!("commands::apply routes only this module's commands here"),
     }
 }
 
 /// How far apart two clips may sit and still count as touching, in seconds.
 const JOIN_EPSILON: f64 = 1e-6;
+
+/// The spans of a [`Command::CutSpans`], made safe to cut in order: each
+/// put the right way round and clamped to the clip, overlapping and
+/// touching ones merged, slivers dropped, earliest first.
+fn cut_spans_within(spans: &[[f64; 2]], clip_start: f64, clip_end: f64) -> Vec<(f64, f64)> {
+    let mut clamped: Vec<(f64, f64)> = spans
+        .iter()
+        .map(|[a, b]| (a.min(*b).max(clip_start), a.max(*b).min(clip_end)))
+        .filter(|(start, end)| end - start > MIN_CLIP_DURATION)
+        .collect();
+    clamped.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(clamped.len());
+    for (start, end) in clamped {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 + MIN_CLIP_DURATION => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
 
 /// The ripple of a delete: pulls every clip that sits after a removed
 /// span left by the length of the removed spans before it, on that clip's
